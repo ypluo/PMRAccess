@@ -1,0 +1,475 @@
+From 741c8a50c91f8a8ca8355896bb886224ef3b254d Mon Sep 17 00:00:00 2001
+From: "guojinhui.liam" <guojinhui.liam@bytedance.com>
+Date: Thu, 3 Nov 2022 18:11:09 +0800
+Subject: [PATCH 2/2] NVMe: CMB on DMA-BUF
+
+Allocate a CMB region to user-space as a DMA-BUF object.
+
+Signed-off-by: guojinhui.liam <guojinhui.liam@bytedance.com>
+---
+ drivers/nvme/host/Makefile      |   2 +-
+ drivers/nvme/host/dmabuf.c      | 312 ++++++++++++++++++++++++++++++++
+ drivers/nvme/host/ioctl.c       |  29 +++
+ drivers/nvme/host/nvme-pci.h    |   2 +
+ drivers/nvme/host/nvme.h        |   1 +
+ drivers/nvme/host/pci.c         |   6 +
+ include/uapi/linux/nvme_ioctl.h |  11 ++
+ 7 files changed, 362 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/nvme/host/dmabuf.c
+
+diff --git a/drivers/nvme/host/Makefile b/drivers/nvme/host/Makefile
+index cbc509784b2e..d60ed7df3321 100644
+--- a/drivers/nvme/host/Makefile
++++ b/drivers/nvme/host/Makefile
+@@ -17,7 +17,7 @@ nvme-core-$(CONFIG_BLK_DEV_ZONED)	+= zns.o
+ nvme-core-$(CONFIG_FAULT_INJECTION_DEBUG_FS)	+= fault_inject.o
+ nvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
+ 
+-nvme-y					+= pci.o
++nvme-y					+= pci.o dmabuf.o
+ 
+ nvme-fabrics-y				+= fabrics.o
+ 
+diff --git a/drivers/nvme/host/dmabuf.c b/drivers/nvme/host/dmabuf.c
+new file mode 100644
+index 000000000000..7ca8e70f2db9
+--- /dev/null
++++ b/drivers/nvme/host/dmabuf.c
+@@ -0,0 +1,312 @@
++/*
++ * Copyright © 2016 Mellanox Technlogies. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/slab.h>
++#include <linux/genalloc.h>
++#include <linux/dma-buf.h>
++
++#include "nvme-pci.h"
++
++struct nvme_cmb_object {
++	struct nvme_dev *dev;
++	struct dma_buf *dma_buf;
++	void *addr;
++	dma_addr_t dma_addr;
++	int attachments;
++	struct kref refcount;
++};
++
++static size_t obj_size(struct nvme_cmb_object *obj)
++{
++	return obj->dma_buf->size;
++}
++
++struct nvme_cmb_attachment {
++	struct sg_table sgt;
++	enum dma_data_direction dir;
++};
++
++static void nvme_cmb_object_get(struct nvme_cmb_object *obj)
++{
++	kref_get(&obj->refcount);
++}
++
++static void nvme_cmb_object_release(struct kref *kref)
++{
++	struct nvme_cmb_object *obj =
++		container_of(kref, struct nvme_cmb_object, refcount);
++
++	WARN_ON(obj->attachments);
++	WARN_ON(obj->addr || obj->dma_addr);
++
++	if (obj->dma_buf)
++		dma_buf_put(obj->dma_buf);
++	kfree(obj);
++}
++
++static void nvme_cmb_object_put(struct nvme_cmb_object *obj)
++{
++	kref_put(&obj->refcount, nvme_cmb_object_release);
++}
++
++static int nvme_cmb_map_attach(struct dma_buf *dma_buf,
++			       struct dma_buf_attachment *attach)
++{
++	struct nvme_cmb_attachment *cmb_attach;
++	struct nvme_cmb_object *obj = dma_buf->priv;
++	struct nvme_dev *dev = obj->dev;
++	int ret;
++
++	cmb_attach = kzalloc(sizeof(*cmb_attach), GFP_KERNEL);
++	if (!cmb_attach)
++		return -ENOMEM;
++
++	/*
++	 * TODO check there is no IOMMU enabled and there is peer to peer
++	 * access between target_dev and our device
++	 */
++
++	cmb_attach->dir = DMA_NONE;
++	attach->priv = cmb_attach;
++
++	if (!obj->attachments) {
++		obj->addr = nvme_alloc_cmb(dev, obj_size(obj), &obj->dma_addr);
++		if (!obj->addr) {
++			ret = -ENOMEM;
++			goto free;
++		}
++	}
++	++obj->attachments;
++
++	return 0;
++
++free:
++	kfree(cmb_attach);
++	return ret;
++}
++
++static void nvme_cmb_map_detach(struct dma_buf *dma_buf,
++				struct dma_buf_attachment *attach)
++{
++	struct nvme_cmb_attachment *cmb_attach = attach->priv;
++	struct nvme_cmb_object *obj = dma_buf->priv;
++	struct nvme_dev *dev = obj->dev;
++
++	if (!cmb_attach)
++		return;
++
++	if (!--obj->attachments) {
++		nvme_free_cmb(dev, obj->addr, obj_size(obj));
++		obj->addr = NULL;
++		obj->dma_addr = 0;
++	}
++
++	if (cmb_attach->dir != DMA_NONE) {
++		/* TODO something like dma_unmap_resource */
++		sg_free_table(&cmb_attach->sgt);
++	}
++
++	kfree(cmb_attach);
++	attach->priv = NULL;
++}
++
++static struct sg_table *nvme_cmb_map_dma_buf(struct dma_buf_attachment *attach,
++					     enum dma_data_direction dir)
++{
++	struct nvme_cmb_attachment *cmb_attach = attach->priv;
++	struct nvme_cmb_object *obj = attach->dmabuf->priv;
++	int ret;
++
++	if (WARN_ON(dir == DMA_NONE || !cmb_attach))
++		return ERR_PTR(-EINVAL);
++
++	/* return the cached mapping when possible */
++	if (cmb_attach->dir == dir)
++		return &cmb_attach->sgt;
++
++	/*
++	 * two mappings with different directions for the same attachment are
++	 * not allowed
++	 */
++	if (WARN_ON(cmb_attach->dir != DMA_NONE))
++		return ERR_PTR(-EBUSY);
++
++	ret = sg_alloc_table(&cmb_attach->sgt, 1, GFP_KERNEL);
++	if (ret)
++		return ERR_PTR(ret);
++
++	/*
++	 * TODO
++	 * 1. Use something like dma_map_resource to get DMA mapping for the
++	 *    BAR.
++	 * 2. no struct page for this address, just a pfn. Make sure callers
++	 *    don't need it.
++	 */
++	sg_dma_address(cmb_attach->sgt.sgl) = obj->dma_addr;
++#ifdef CONFIG_NEED_SG_DMA_LENGTH
++	sg_dma_len(cmb_attach->sgt.sgl) = obj_size(obj);
++#endif
++
++	cmb_attach->dir = dir;
++
++	return &cmb_attach->sgt;
++}
++
++static void nvme_cmb_unmap_dma_buf(struct dma_buf_attachment *attach,
++				   struct sg_table *sgt,
++				   enum dma_data_direction dir)
++{
++	/* nothing to be done here */
++}
++
++static void nvme_cmb_dmabuf_release(struct dma_buf *dma_buf)
++{
++	struct nvme_cmb_object *obj = dma_buf->priv;
++
++	if (!obj)
++		return;
++
++	nvme_cmb_object_put(obj);
++}
++
++/*
++static void *nvme_cmb_dmabuf_kmap_atomic(struct dma_buf *dma_buf,
++					 unsigned long page_num)
++{
++	struct nvme_cmb_object *obj = dma_buf->priv;
++
++	if (!obj || !obj->addr)
++		return NULL;
++
++	return obj->addr + (page_num << PAGE_SHIFT);
++}
++*/
++
++static void nvme_cmb_vm_open(struct vm_area_struct *vma)
++{
++	struct nvme_cmb_object *obj = vma->vm_private_data;
++
++	nvme_cmb_object_get(obj);
++}
++
++static void nvme_cmb_vm_close(struct vm_area_struct *vma)
++{
++	struct nvme_cmb_object *obj = vma->vm_private_data;
++
++	nvme_cmb_object_put(obj);
++}
++
++static vm_fault_t nvme_cmb_fault(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct nvme_cmb_object *obj = vma->vm_private_data;
++	// pgoff_t offset;
++	unsigned long pfn;
++	int err;
++
++	if (!obj->addr || is_cow_mapping(vma->vm_flags))
++		return VM_FAULT_SIGBUS;
++
++	// offset = (vmf->address - vma->vm_start);
++	// pfn = ((unsigned long)obj->addr + offset) >> PAGE_SHIFT;
++
++	// err = vmf_insert_pfn(vma, vmf->address, pfn);
++
++	pfn = obj->dma_addr >> PAGE_SHIFT;
++	err = io_remap_pfn_range(vma, vma->vm_start, pfn, vma->vm_end - vma->vm_start, vma->vm_page_prot);
++	switch (err) {
++	case -EAGAIN:
++	case 0:
++	case -ERESTARTSYS:
++	case -EINTR:
++	case -EBUSY:
++		return VM_FAULT_NOPAGE;
++
++	case -ENOMEM:
++		return VM_FAULT_OOM;
++	}
++
++	return VM_FAULT_SIGBUS;
++}
++
++static const struct vm_operations_struct nvme_cmb_vm_ops = {
++	.fault = nvme_cmb_fault,
++	.open = nvme_cmb_vm_open,
++	.close = nvme_cmb_vm_close,
++};
++
++static int nvme_cmb_dmabuf_mmap(struct dma_buf *dma_buf,
++				struct vm_area_struct *vma)
++{
++	struct nvme_cmb_object *obj = dma_buf->priv;
++
++	/* Check for valid size. */
++	if (obj_size(obj) < vma->vm_end - vma->vm_start)
++		return -EINVAL;
++
++	/* TODO: save vma->vm_start and vma->vm_end to obj due to vma merged */
++	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
++	vma->vm_ops = &nvme_cmb_vm_ops;
++	vma->vm_private_data = obj;
++	vma->vm_page_prot =
++		pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
++
++	nvme_cmb_object_get(obj);
++
++	return 0;
++}
++
++static const struct dma_buf_ops nvme_cmb_dmabuf_ops =  {
++	.attach = nvme_cmb_map_attach,
++	.detach = nvme_cmb_map_detach,
++	.map_dma_buf = nvme_cmb_map_dma_buf,
++	.unmap_dma_buf = nvme_cmb_unmap_dma_buf,
++	.release = nvme_cmb_dmabuf_release,
++	.mmap = nvme_cmb_dmabuf_mmap,
++};
++
++int nvme_pci_alloc_user_cmb(struct nvme_dev *dev, u64 size)
++{
++	struct nvme_cmb_object *obj;
++	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++	int ret;
++
++	obj = kzalloc(sizeof(*obj), GFP_KERNEL);
++	if (!obj)
++		return -ENOMEM;
++
++	kref_init(&obj->refcount);
++	obj->dev = dev;
++
++	exp_info.ops = &nvme_cmb_dmabuf_ops;
++	exp_info.size = size;
++	exp_info.flags = O_CLOEXEC | O_RDWR;
++	exp_info.priv = obj;
++
++	obj->dma_buf = dma_buf_export(&exp_info);
++	if (IS_ERR(obj->dma_buf)) {
++		ret = PTR_ERR(obj->dma_buf);
++		goto put_obj;
++	}
++
++	ret = dma_buf_fd(obj->dma_buf, exp_info.flags);
++	if (ret < 0)
++		goto put_obj;
++
++	return ret;
++
++put_obj:
++	nvme_cmb_object_put(obj);
++	return ret;
++}
++
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index 305ddd415e45..3830763c9bd0 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -472,6 +472,33 @@ static int nvme_dev_user_cmd(struct nvme_ctrl *ctrl, void __user *argp)
+ 	return ret;
+ }
+ 
++static int nvme_alloc_user_cmb(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++                               struct nvme_alloc_user_cmb __user *ucmd)
++{
++        struct nvme_alloc_user_cmb cmd;
++        int status;
++
++        if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
++                return -EFAULT;
++        if (cmd.flags || cmd.rsvd1 || cmd.opcode)
++                return -EINVAL;
++
++        if (!ctrl->ops->alloc_user_cmb)
++                return -ENOTTY;
++
++        status = ctrl->ops->alloc_user_cmb(ctrl, cmd.size);
++        if (status < 0)
++                return status;
++
++        cmd.fd = status;
++        if (copy_to_user(ucmd, &cmd, sizeof(cmd)))
++                return -EFAULT;
++
++        return 0;
++}
++
+ long nvme_dev_ioctl(struct file *file, unsigned int cmd,
+ 		unsigned long arg)
+ {
+@@ -493,6 +520,8 @@ long nvme_dev_ioctl(struct file *file, unsigned int cmd,
+ 	case NVME_IOCTL_RESCAN:
+ 		nvme_queue_scan(ctrl);
+ 		return 0;
++	case NVME_IOCTL_ALLOC_USER_CMB:
++		return nvme_alloc_user_cmb(ctrl, NULL, argp);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+diff --git a/drivers/nvme/host/nvme-pci.h b/drivers/nvme/host/nvme-pci.h
+index 5b29508dc182..2292d2c24fda 100644
+--- a/drivers/nvme/host/nvme-pci.h
++++ b/drivers/nvme/host/nvme-pci.h
+@@ -18,6 +18,8 @@
+ 
+ struct nvme_dev;
+ 
++int nvme_pci_alloc_user_cmb(struct nvme_dev *dev, u64 size);
++
+ void *nvme_alloc_cmb(struct nvme_dev *dev, size_t size, dma_addr_t *dma_addr);
+ void nvme_free_cmb(struct nvme_dev *dev, void *addr, size_t size);
+ 
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 5cd1fa3b8464..6c2a1a2f44cd 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -495,6 +495,7 @@ struct nvme_ctrl_ops {
+ 	void (*submit_async_event)(struct nvme_ctrl *ctrl);
+ 	void (*delete_ctrl)(struct nvme_ctrl *ctrl);
+ 	int (*get_address)(struct nvme_ctrl *ctrl, char *buf, int size);
++	int (*alloc_user_cmb)(struct nvme_ctrl *ctrl, u64 size);
+ };
+ 
+ #ifdef CONFIG_FAULT_INJECTION_DEBUG_FS
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 0a1861ca9bf8..05834a252151 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2870,6 +2870,11 @@ static int nvme_pci_get_address(struct nvme_ctrl *ctrl, char *buf, int size)
+ 	return snprintf(buf, size, "%s\n", dev_name(&pdev->dev));
+ }
+ 
++static int nvme_pci_alloc_user_cmb_wrapper(struct nvme_ctrl *ctrl, u64 size)
++{
++	return nvme_pci_alloc_user_cmb(to_nvme_dev(ctrl), size);
++}
++
+ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+ 	.name			= "pcie",
+ 	.module			= THIS_MODULE,
+@@ -2881,6 +2886,7 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+ 	.free_ctrl		= nvme_pci_free_ctrl,
+ 	.submit_async_event	= nvme_pci_submit_async_event,
+ 	.get_address		= nvme_pci_get_address,
++	.alloc_user_cmb         = nvme_pci_alloc_user_cmb_wrapper,
+ };
+ 
+ static int nvme_dev_map(struct nvme_dev *dev)
+diff --git a/include/uapi/linux/nvme_ioctl.h b/include/uapi/linux/nvme_ioctl.h
+index d99b5a772698..b822ade8a5a8 100644
+--- a/include/uapi/linux/nvme_ioctl.h
++++ b/include/uapi/linux/nvme_ioctl.h
+@@ -69,6 +69,16 @@ struct nvme_passthru_cmd64 {
+ 
+ #define nvme_admin_cmd nvme_passthru_cmd
+ 
++struct nvme_alloc_user_cmb {
++	/* in */
++	__u8	opcode;
++	__u8	flags;
++	__u16	rsvd1;
++	__u64 size;
++	/* out */
++	__u32 fd;
++};
++
+ #define NVME_IOCTL_ID		_IO('N', 0x40)
+ #define NVME_IOCTL_ADMIN_CMD	_IOWR('N', 0x41, struct nvme_admin_cmd)
+ #define NVME_IOCTL_SUBMIT_IO	_IOW('N', 0x42, struct nvme_user_io)
+@@ -78,5 +88,6 @@ struct nvme_passthru_cmd64 {
+ #define NVME_IOCTL_RESCAN	_IO('N', 0x46)
+ #define NVME_IOCTL_ADMIN64_CMD	_IOWR('N', 0x47, struct nvme_passthru_cmd64)
+ #define NVME_IOCTL_IO64_CMD	_IOWR('N', 0x48, struct nvme_passthru_cmd64)
++#define NVME_IOCTL_ALLOC_USER_CMB _IOWR('N', 0x49, struct nvme_alloc_user_cmb)
+ 
+ #endif /* _UAPI_LINUX_NVME_IOCTL_H */
+-- 
+2.20.1
+

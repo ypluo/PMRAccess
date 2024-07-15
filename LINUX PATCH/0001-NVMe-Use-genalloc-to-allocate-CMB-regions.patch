@@ -1,0 +1,216 @@
+From d332e5631162b159b75b3d94dc487f8898f16672 Mon Sep 17 00:00:00 2001
+From: "guojinhui.liam" <guojinhui.liam@bytedance.com>
+Date: Thu, 3 Nov 2022 17:51:00 +0800
+Subject: [PATCH 1/2] NVMe: Use genalloc to allocate CMB regions
+
+Register the CMB in a gen_pool dedicated to manage CMB regions. Use the
+pool to allocate the SQs to make sure they are registered.
+
+Signed-off-by: guojinhui.liam <guojinhui.liam@bytedance.com>
+---
+ drivers/nvme/host/nvme-pci.h | 24 ++++++++++++
+ drivers/nvme/host/pci.c      | 72 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+)
+ create mode 100644 drivers/nvme/host/nvme-pci.h
+
+diff --git a/drivers/nvme/host/nvme-pci.h b/drivers/nvme/host/nvme-pci.h
+new file mode 100644
+index 000000000000..5b29508dc182
+--- /dev/null
++++ b/drivers/nvme/host/nvme-pci.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright © 2016 Mellanox Technlogies. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef _NVME_PCI_H
++#define _NVME_PCI_H
++
++#include "nvme.h"
++
++struct nvme_dev;
++
++void *nvme_alloc_cmb(struct nvme_dev *dev, size_t size, dma_addr_t *dma_addr);
++void nvme_free_cmb(struct nvme_dev *dev, void *addr, size_t size);
++
++#endif
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 51852085239e..0a1861ca9bf8 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -26,9 +26,11 @@
+ #include <linux/io-64-nonatomic-hi-lo.h>
+ #include <linux/sed-opal.h>
+ #include <linux/pci-p2pdma.h>
++#include <linux/genalloc.h>
+ 
+ #include "trace.h"
+ #include "nvme.h"
++#include "nvme-pci.h"
+ 
+ #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
+ #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
+@@ -129,10 +131,12 @@ struct nvme_dev {
+ 	struct work_struct remove_work;
+ 	struct mutex shutdown_lock;
+ 	bool subsystem;
++	void __iomem *cmb;
+ 	u64 cmb_size;
+ 	bool cmb_use_sqes;
+ 	u32 cmbsz;
+ 	u32 cmbloc;
++	struct gen_pool *cmb_pool;
+ 	struct nvme_ctrl ctrl;
+ 	u32 last_ps;
+ 
+@@ -1358,14 +1362,19 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 
+ static void nvme_free_queue(struct nvme_queue *nvmeq)
+ {
++	struct nvme_dev *dev = nvmeq->dev;
++
+ 	dma_free_coherent(nvmeq->dev->dev, CQ_SIZE(nvmeq),
+ 				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
+ 	if (!nvmeq->sq_cmds)
+ 		return;
+ 
+ 	if (test_and_clear_bit(NVMEQ_SQ_CMB, &nvmeq->flags)) {
++		nvme_free_cmb(dev, nvmeq->sq_cmds, SQ_SIZE(nvmeq));
++		/*
+ 		pci_free_p2pmem(to_pci_dev(nvmeq->dev->dev),
+ 				nvmeq->sq_cmds, SQ_SIZE(nvmeq));
++		*/
+ 	} else {
+ 		dma_free_coherent(nvmeq->dev->dev, SQ_SIZE(nvmeq),
+ 				nvmeq->sq_cmds, nvmeq->sq_dma_addr);
+@@ -1470,6 +1479,12 @@ static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 
+ 	if (qid && dev->cmb_use_sqes && (dev->cmbsz & NVME_CMBSZ_SQS)) {
++		nvmeq->sq_cmds = nvme_alloc_cmb(dev, SQ_SIZE(nvmeq), &nvmeq->sq_dma_addr);
++		if (nvmeq->sq_cmds) {
++			set_bit(NVMEQ_SQ_CMB, &nvmeq->flags);
++			return 0;
++		}
++		/*
+ 		nvmeq->sq_cmds = pci_alloc_p2pmem(pdev, SQ_SIZE(nvmeq));
+ 		if (nvmeq->sq_cmds) {
+ 			nvmeq->sq_dma_addr = pci_p2pmem_virt_to_bus(pdev,
+@@ -1481,6 +1496,7 @@ static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
+ 
+ 			pci_free_p2pmem(pdev, nvmeq->sq_cmds, SQ_SIZE(nvmeq));
+ 		}
++		*/
+ 	}
+ 
+ 	nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(nvmeq),
+@@ -1837,6 +1853,9 @@ static void nvme_map_cmb(struct nvme_dev *dev)
+ 	resource_size_t bar_size;
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	int bar;
++	dma_addr_t dma_addr;
++	void __iomem *cmb;
++	int ret;
+ 
+ 	if (dev->cmb_size)
+ 		return;
+@@ -1875,34 +1894,87 @@ static void nvme_map_cmb(struct nvme_dev *dev)
+ 	if (size > bar_size - offset)
+ 		size = bar_size - offset;
+ 
++	/*
+ 	if (pci_p2pdma_add_resource(pdev, bar, size, offset)) {
+ 		dev_warn(dev->ctrl.device,
+ 			 "failed to register the CMB\n");
+ 		return;
+ 	}
++	*/
+ 
+ 	dev->cmb_size = size;
+ 	dev->cmb_use_sqes = use_cmb_sqes && (dev->cmbsz & NVME_CMBSZ_SQS);
+ 
++	dma_addr = pci_resource_start(pdev, bar) + offset;
++	cmb = ioremap_wc(dma_addr, size);
++	if (!cmb) {
++		dev_warn(dev->ctrl.device,
++			"failed to remap the CMB\n");
++		return;
++	}
++	dev->cmb = cmb;
++	dev->cmb_pool = gen_pool_create(PAGE_SHIFT, -1);
++	if (!dev->cmb_pool) {
++		dev_warn(dev->ctrl.device,
++			"failed to gen_pool_create for CMB\n");
++		goto unmap;
++	}
++
++	ret = gen_pool_add_virt(dev->cmb_pool, (unsigned long)(uintptr_t)cmb,
++				dma_addr, size, -1);
++	if (ret) {
++		dev_warn(dev->ctrl.device,
++			"failed to gen_pool_add_virt for CMB\n");
++		goto destroy_pool;
++	}
++
++	/*
+ 	if ((dev->cmbsz & (NVME_CMBSZ_WDS | NVME_CMBSZ_RDS)) ==
+ 			(NVME_CMBSZ_WDS | NVME_CMBSZ_RDS))
+ 		pci_p2pmem_publish(pdev, true);
++	*/
+ 
+ 	if (sysfs_add_file_to_group(&dev->ctrl.device->kobj,
+ 				    &dev_attr_cmb.attr, NULL))
+ 		dev_warn(dev->ctrl.device,
+ 			 "failed to add sysfs attribute for CMB\n");
++
++	return;
++
++destroy_pool:
++	gen_pool_destroy(dev->cmb_pool);
++	dev->cmb_pool = NULL;
++unmap:
++	iounmap(cmb);
+ }
+ 
+ static inline void nvme_release_cmb(struct nvme_dev *dev)
+ {
+ 	if (dev->cmb_size) {
++		gen_pool_destroy(dev->cmb_pool);
++		iounmap(dev->cmb);
+ 		sysfs_remove_file_from_group(&dev->ctrl.device->kobj,
+ 					     &dev_attr_cmb.attr, NULL);
+ 		dev->cmb_size = 0;
+ 	}
+ }
+ 
++void *nvme_alloc_cmb(struct nvme_dev *dev, size_t size, dma_addr_t *dma_addr)
++{
++        if (!dev->cmb_pool)
++                return NULL;
++
++        return gen_pool_dma_alloc(dev->cmb_pool, size, dma_addr);
++}
++
++void nvme_free_cmb(struct nvme_dev *dev, void *addr, size_t size)
++{
++        if (WARN_ON(!dev->cmb_pool))
++                return;
++
++        gen_pool_free(dev->cmb_pool, (unsigned long)(uintptr_t)addr, size);
++}
++
+ static int nvme_set_host_mem(struct nvme_dev *dev, u32 bits)
+ {
+ 	u32 host_mem_size = dev->host_mem_size >> NVME_CTRL_PAGE_SHIFT;
+-- 
+2.20.1
+
